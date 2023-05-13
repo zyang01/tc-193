@@ -10,10 +10,7 @@ impl ExchangeConnection for BinanceConnection {
         info!("Subscribing to {} on Binance", symbol);
         self.subscribed_channels.push(symbol.to_string());
     }
-}
-
-impl BinanceConnection {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             subscribed_channels: vec![],
         }
