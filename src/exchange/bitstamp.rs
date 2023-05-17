@@ -12,16 +12,22 @@ const WEBSOCKET_URL: &str = "wss://ws.bitstamp.net";
 const CONNECTION_RETRY_INTERVAL_SECONDS: u64 = 1;
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 
+/// Orderbook update
 #[derive(Debug, Deserialize)]
 struct Orderbook {
     #[serde(rename = "timestamp")]
     _timestamp: String,
     microtimestamp: String,
+
+    /// Bids represented as `[[price, amount], ...]`
     bids: Vec<[String; 2]>,
+
+    /// Asks represented as `[[price, amount], ...]`
     asks: Vec<[String; 2]>,
 }
 
 impl Into<super::Orderbook> for Orderbook {
+    /// Converts orderbook to `super::Orderbook`
     fn into(self) -> super::Orderbook {
         let microtimestamp = self.microtimestamp.parse::<u64>().unwrap();
         super::Orderbook {
@@ -43,7 +49,9 @@ enum ExchangeMessage {
     SubscriptionSucceeded(String),
 }
 
+/// Bitsamp websocket connection
 pub struct BitstampConnection {
+    /// Channel to send commands to
     command_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -63,6 +71,12 @@ impl ExchangeConnection for BitstampConnection {
 }
 
 /// Converts websocket message to ExchangeMessage
+///
+/// # Arguments
+/// * `message` - Websocket message
+///
+/// # Returns
+/// * `Option<ExchangeMessage>` - Exchange message
 fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
     let mut message: serde_json::Value = serde_json::from_str(message.to_text().ok()?).ok()?;
     let data = message["data"].take();
@@ -82,6 +96,12 @@ fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
 }
 
 /// Event loop for handling websocket messages and exchange commands
+///
+/// # Arguments
+/// * `subscribed_channels` - Set of subscribed channels
+/// * `websocket_stream` - Websocket stream
+/// * `command_rx` - Channel to receive commands from
+/// * `exchange_message_tx` - Channel to send exchange messages to
 async fn new_message_handler(
     subscribed_messages: &mut HashSet<String>,
     websocket_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -162,6 +182,10 @@ async fn new_message_handler(
 }
 
 /// Opens and manages websocket (re)connection
+///
+/// # Arguments
+/// * `command_rx` - Channel to receive commands from
+/// * `exchange_message_tx` - Channel to send exchange messages to
 async fn new_connection_handler(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     mut exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>,

@@ -14,15 +14,21 @@ const CONNECTION_RETRY_INTERVAL_SECONDS: u64 = 1;
 const PONG_INTERVAL_SECONDS: u64 = 30;
 const PONG_MESSAGE: Message = Message::Pong(vec![]);
 
+/// Orderbook update
 #[derive(Debug, Deserialize)]
 struct Orderbook {
     #[serde(rename = "lastUpdateId")]
     last_update_id: u64,
+
+    /// Bids represented as `[[price, amount], ...]`
     bids: Vec<[String; 2]>,
+
+    /// Asks represented as `[[price, amount], ...]`
     asks: Vec<[String; 2]>,
 }
 
 impl Into<super::Orderbook> for Orderbook {
+    /// Converts orderbook to `super::Orderbook`
     fn into(self) -> super::Orderbook {
         super::Orderbook {
             monotonic_counter: self.last_update_id,
@@ -33,6 +39,7 @@ impl Into<super::Orderbook> for Orderbook {
     }
 }
 
+/// Orderbook diff update
 #[derive(Debug, Deserialize)]
 struct OrderbookDiff {
     #[serde(rename = "E")]
@@ -62,7 +69,9 @@ enum ExchangeMessage {
     _SubscriptionSucceeded(String),
 }
 
+/// Binance websocket connection
 pub struct BinanceConnection {
+    /// Channel to send commands to
     command_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -82,6 +91,12 @@ impl ExchangeConnection for BinanceConnection {
 }
 
 /// Creates a new subscribe message for given channels
+///
+/// # Arguments
+/// * `channels` - Channels to subscribe to
+///
+/// # Returns
+/// * `String` - Subscribe message
 fn new_subscribe_message(channels: Vec<String>) -> String {
     json!({
         "method": "SUBSCRIBE",
@@ -95,6 +110,12 @@ fn new_subscribe_message(channels: Vec<String>) -> String {
 }
 
 /// Converts websocket message to ExchangeMessage
+///
+/// # Arguments
+/// * `message` - Websocket message
+///
+/// # Returns
+/// * `Option<ExchangeMessage>` - Exchange message
 fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
     let mut message: serde_json::Value = serde_json::from_str(message.to_text().ok()?).ok()?;
     let data = message["data"].take();
@@ -117,6 +138,13 @@ fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
     }
 }
 
+/// Event loop for handling websocket messages and exchange commands
+///
+/// # Arguments
+/// * `subscribed_channels` - Set of subscribed channels
+/// * `websocket_stream` - Websocket stream
+/// * `command_rx` - Channel to receive commands from
+/// * `exchange_message_tx` - Channel to send exchange messages to
 async fn new_message_handler(
     subscribed_channels: &mut HashSet<String>,
     websocket_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -202,6 +230,10 @@ async fn new_message_handler(
 }
 
 /// Opens and manages websocket (re)connection
+///
+/// # Arguments
+/// * `command_rx` - Channel to receive commands from
+/// * `exchange_message_tx` - Channel to send exchange messages to
 async fn new_connection_handler(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     mut exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>,
