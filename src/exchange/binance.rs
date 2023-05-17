@@ -8,6 +8,7 @@ use std::{collections::HashSet, time::SystemTime};
 use tokio::{net::TcpStream, select, sync::mpsc};
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
+const EXCHANGE_NAME: &str = "binance";
 const WEBSOCKET_URL: &str = "wss://stream.binance.com:9443/stream";
 const CONNECTION_RETRY_INTERVAL_SECONDS: u64 = 1;
 const PONG_INTERVAL_SECONDS: u64 = 30;
@@ -21,20 +22,31 @@ struct Orderbook {
     asks: Vec<[String; 2]>,
 }
 
+impl Into<super::Orderbook> for Orderbook {
+    fn into(self) -> super::Orderbook {
+        super::Orderbook {
+            monotonic_counter: self.last_update_id,
+            microtimestamp: None,
+            bids: self.bids,
+            asks: self.asks,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OrderbookDiff {
     #[serde(rename = "E")]
     _event_timestamp: u64,
     #[serde(rename = "s")]
-    instrument_id: String,
+    _instrument_id: String,
     #[serde(rename = "U")]
-    first_update_id: u64,
+    _first_update_id: u64,
     #[serde(rename = "u")]
-    last_update_id: u64,
+    _last_update_id: u64,
     #[serde(rename = "b")]
-    bids: Vec<[String; 2]>,
+    _bids: Vec<[String; 2]>,
     #[serde(rename = "a")]
-    asks: Vec<[String; 2]>,
+    _asks: Vec<[String; 2]>,
 }
 
 /// Binance websocket message types
@@ -47,7 +59,7 @@ enum ExchangeMessage {
     OrderbookDiff(OrderbookDiff),
 
     /// Successful subscription message containing the channel name
-    SubscriptionSucceeded(String),
+    _SubscriptionSucceeded(String),
 }
 
 pub struct BinanceConnection {
@@ -55,16 +67,16 @@ pub struct BinanceConnection {
 }
 
 impl ExchangeConnection for BinanceConnection {
-    fn subscribe_orderbook(&mut self, symbol: &str) {
-        info!("Subscribing to {} on Binance", symbol);
+    fn subscribe_orderbook(&mut self, instrument_id: &str) {
+        info!("Subscribing to {instrument_id} on Binance");
         self.command_tx
-            .send(Command::SubscribeOrderbook(symbol.to_string()))
+            .send(Command::SubscribeOrderbook(instrument_id.to_string()))
             .unwrap();
     }
 
-    fn new() -> Self {
+    fn new(exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        tokio::spawn(new_connection_handler(command_rx));
+        tokio::spawn(new_connection_handler(command_rx, exchange_message_tx));
         Self { command_tx }
     }
 }
@@ -109,6 +121,7 @@ async fn new_message_handler(
     subscribed_channels: &mut HashSet<String>,
     websocket_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     command_rx: &mut mpsc::UnboundedReceiver<Command>,
+    exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
 ) {
     let (mut websocket_tx, mut websocket_rx) = websocket_stream.split();
 
@@ -132,12 +145,12 @@ async fn new_message_handler(
             }
             Some(command) = command_rx.recv() => {
                 match command {
-                    Command::SubscribeOrderbook(symbol) => {
-                        info!("Subscribing to {symbol} orderbook on Binance");
+                    Command::SubscribeOrderbook(instrument_id) => {
+                        info!("Subscribing to {instrument_id} orderbook on Binance");
                         let channels = vec![
-                            format!("{symbol}@depth@100ms", symbol=symbol),
-                            format!("{symbol}@depth10@100ms", symbol=symbol),
-                            format!("{symbol}@depth20@100ms", symbol=symbol)
+                            format!("{instrument_id}@depth@100ms"),
+                            format!("{instrument_id}@depth10@100ms"),
+                            format!("{instrument_id}@depth20@100ms")
                         ];
                         channels.iter().for_each(|channel| {
                             subscribed_channels.insert(channel.to_string());
@@ -153,7 +166,15 @@ async fn new_message_handler(
                     Some(Ok(message)) if message.is_text() => {
                         match parse_exchange_message(&message) {
                             Some(message) => {
-                                info!("Received message from Binance: {message:?}")
+                                if let ExchangeMessage::Orderbook(instrument_id, orderbook) = message {
+                                    exchange_message_tx.send(super::ExchangeMessage::Orderbook(
+                                        EXCHANGE_NAME.to_string(),
+                                        instrument_id,
+                                        orderbook.into()
+                                    )).unwrap();
+                                } else {
+                                    trace!("Received message from Binance: {message:?}")
+                                }
                             },
                             None => {
                                 warn!("Unknown message received from Binance: {message:?}");
@@ -181,7 +202,10 @@ async fn new_message_handler(
 }
 
 /// Opens and manages websocket (re)connection
-async fn new_connection_handler(mut command_rx: mpsc::UnboundedReceiver<Command>) {
+async fn new_connection_handler(
+    mut command_rx: mpsc::UnboundedReceiver<Command>,
+    mut exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>,
+) {
     let websocket_url = url::Url::parse(WEBSOCKET_URL).unwrap();
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     loop {
@@ -201,6 +225,12 @@ async fn new_connection_handler(mut command_rx: mpsc::UnboundedReceiver<Command>
                 continue;
             }
         };
-        new_message_handler(&mut subscribed_channels, websocket_stream, &mut command_rx).await;
+        new_message_handler(
+            &mut subscribed_channels,
+            websocket_stream,
+            &mut command_rx,
+            &mut exchange_message_tx,
+        )
+        .await;
     }
 }

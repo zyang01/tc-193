@@ -7,23 +7,37 @@ use std::collections::HashSet;
 use tokio::{net::TcpStream, select, sync::mpsc};
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
+const EXCHANGE_NAME: &str = "bitstamp";
 const WEBSOCKET_URL: &str = "wss://ws.bitstamp.net";
 const CONNECTION_RETRY_INTERVAL_SECONDS: u64 = 1;
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 
 #[derive(Debug, Deserialize)]
 struct Orderbook {
-    timestamp: String,
+    #[serde(rename = "timestamp")]
+    _timestamp: String,
     microtimestamp: String,
     bids: Vec<[String; 2]>,
     asks: Vec<[String; 2]>,
+}
+
+impl Into<super::Orderbook> for Orderbook {
+    fn into(self) -> super::Orderbook {
+        let microtimestamp = self.microtimestamp.parse::<u64>().unwrap();
+        super::Orderbook {
+            monotonic_counter: microtimestamp,
+            microtimestamp: Some(microtimestamp),
+            bids: self.bids,
+            asks: self.asks,
+        }
+    }
 }
 
 /// Bitsamp websocket message types
 #[derive(Debug)]
 enum ExchangeMessage {
     /// Orderbook update
-    Orderbook(Orderbook),
+    Orderbook(String, Orderbook),
 
     /// Successful subscription message containing the channel name
     SubscriptionSucceeded(String),
@@ -34,16 +48,16 @@ pub struct BitstampConnection {
 }
 
 impl ExchangeConnection for BitstampConnection {
-    fn subscribe_orderbook(&mut self, symbol: &str) {
-        info!("Subscribing to {} on Bitstamp", symbol);
+    fn subscribe_orderbook(&mut self, instrument_id: &str) {
+        info!("Subscribing to {instrument_id} on Bitstamp");
         self.command_tx
-            .send(Command::SubscribeOrderbook(symbol.to_string()))
+            .send(Command::SubscribeOrderbook(instrument_id.to_string()))
             .unwrap();
     }
 
-    fn new() -> Self {
+    fn new(exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        tokio::spawn(new_connection_handler(command_rx));
+        tokio::spawn(new_connection_handler(command_rx, exchange_message_tx));
         Self { command_tx }
     }
 }
@@ -57,7 +71,8 @@ fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
     match event {
         "data" => {
             let orderbook: Orderbook = serde_json::from_value(data).ok()?;
-            Some(ExchangeMessage::Orderbook(orderbook))
+            let instrument_id = channel.split("_").last()?.to_string();
+            Some(ExchangeMessage::Orderbook(instrument_id, orderbook))
         }
         "bts:subscription_succeeded" => {
             Some(ExchangeMessage::SubscriptionSucceeded(channel.to_string()))
@@ -71,6 +86,7 @@ async fn new_message_handler(
     subscribed_messages: &mut HashSet<String>,
     websocket_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     command_rx: &mut mpsc::UnboundedReceiver<Command>,
+    exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
 ) {
     let (mut websocket_tx, mut websocket_rx) = websocket_stream.split();
 
@@ -95,12 +111,12 @@ async fn new_message_handler(
             }
             Some(command) = command_rx.recv() => {
                 match command {
-                    Command::SubscribeOrderbook(symbol) => {
-                        info!("Subscribing to {symbol} orderbook on Bitstamp");
+                    Command::SubscribeOrderbook(instrument_id) => {
+                        info!("Subscribing to {instrument_id} orderbook on Bitstamp");
                         let message = json!({
                             "event": "bts:subscribe",
                             "data": {
-                                "channel": format!("order_book_{}", symbol)
+                                "channel": format!("order_book_{instrument_id}")
                             }
                         }).to_string();
                         subscribed_messages.insert(message.clone());
@@ -113,7 +129,15 @@ async fn new_message_handler(
                     Some(Ok(message)) if message.is_text() => {
                         match parse_exchange_message(&message) {
                             Some(message) => {
-                                trace!("Received message from Bitstamp: {:?}", message);
+                                if let ExchangeMessage::Orderbook(instrument_id, orderbook) = message {
+                                    exchange_message_tx.send(super::ExchangeMessage::Orderbook(
+                                        EXCHANGE_NAME.to_string(),
+                                        instrument_id,
+                                        orderbook.into(),
+                                    )).unwrap();
+                                } else {
+                                    trace!("Received message from Bitstamp: {:?}", message);
+                                }
                             }
                             None => {
                                 warn!("Unknown message received from Bitstamp: {}", message.to_string());
@@ -138,7 +162,10 @@ async fn new_message_handler(
 }
 
 /// Opens and manages websocket (re)connection
-async fn new_connection_handler(mut command_rx: mpsc::UnboundedReceiver<Command>) {
+async fn new_connection_handler(
+    mut command_rx: mpsc::UnboundedReceiver<Command>,
+    mut exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>,
+) {
     let websocket_url = url::Url::parse(WEBSOCKET_URL).unwrap();
     let mut subscribed_messages: HashSet<String> = HashSet::new();
     loop {
@@ -156,6 +183,12 @@ async fn new_connection_handler(mut command_rx: mpsc::UnboundedReceiver<Command>
                 continue;
             }
         };
-        new_message_handler(&mut subscribed_messages, websocket_stream, &mut command_rx).await;
+        new_message_handler(
+            &mut subscribed_messages,
+            websocket_stream,
+            &mut command_rx,
+            &mut exchange_message_tx,
+        )
+        .await;
     }
 }
