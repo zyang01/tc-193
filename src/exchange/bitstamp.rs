@@ -1,4 +1,4 @@
-use super::ExchangeConnection;
+use super::{Command, ExchangeConnection};
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, trace, warn};
 use serde::Deserialize;
@@ -11,11 +11,6 @@ const WEBSOCKET_URL: &str = "wss://ws.bitstamp.net";
 const CONNECTION_RETRY_INTERVAL_SECONDS: u64 = 1;
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 
-#[derive(Debug)]
-enum Command {
-    SubscribeOrderbook(String),
-}
-
 #[derive(Debug, Deserialize)]
 struct Orderbook {
     timestamp: String,
@@ -24,6 +19,7 @@ struct Orderbook {
     asks: Vec<[String; 2]>,
 }
 
+/// Bitsamp websocket message types
 #[derive(Debug)]
 enum ExchangeMessage {
     /// Orderbook update
