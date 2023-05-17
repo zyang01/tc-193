@@ -1,16 +1,36 @@
 use super::ExchangeConnection;
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
+use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashSet;
 use tokio::{net::TcpStream, select, sync::mpsc};
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 const WEBSOCKET_URL: &str = "wss://ws.bitstamp.net";
 const CONNECTION_RETRY_INTERVAL_SECONDS: u64 = 1;
+const HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 
 #[derive(Debug)]
 enum Command {
     SubscribeOrderbook(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct Orderbook {
+    timestamp: String,
+    microtimestamp: String,
+    bids: Vec<[String; 2]>,
+    asks: Vec<[String; 2]>,
+}
+
+#[derive(Debug)]
+enum ExchangeMessage {
+    /// Orderbook update
+    Orderbook(Orderbook),
+
+    /// Successful subscription message containing the channel name
+    SubscriptionSucceeded(String),
 }
 
 pub struct BitstampConnection {
@@ -32,6 +52,24 @@ impl ExchangeConnection for BitstampConnection {
     }
 }
 
+/// Converts websocket message to ExchangeMessage
+fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
+    let mut message: serde_json::Value = serde_json::from_str(message.to_text().ok()?).ok()?;
+    let data = message["data"].take();
+    let event = message.get("event")?.as_str()?;
+    let channel = message.get("channel")?.as_str()?;
+    match event {
+        "data" => {
+            let orderbook: Orderbook = serde_json::from_value(data).ok()?;
+            Some(ExchangeMessage::Orderbook(orderbook))
+        }
+        "bts:subscription_succeeded" => {
+            Some(ExchangeMessage::SubscriptionSucceeded(channel.to_string()))
+        }
+        _ => None,
+    }
+}
+
 /// Event loop for handling websocket messages and exchange commands
 async fn new_message_handler(
     subscribed_messages: &mut HashSet<String>,
@@ -48,13 +86,27 @@ async fn new_message_handler(
             .unwrap();
     }
 
+    let mut heartbeat_interval =
+        tokio::time::interval(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
+
     loop {
         select! {
+            _ = heartbeat_interval.tick() => {
+                let message = json!({
+                    "event": "bts:heartbeat",
+                }).to_string();
+                websocket_tx.send(Message::Text(message)).await.unwrap();
+            }
             Some(command) = command_rx.recv() => {
                 match command {
                     Command::SubscribeOrderbook(symbol) => {
                         info!("Subscribing to {symbol} orderbook on Bitstamp");
-                        let message = format!(r#"{{"event":"bts:subscribe","data":{{"channel":"diff_order_book_{symbol}"}}}}"#);
+                        let message = json!({
+                            "event": "bts:subscribe",
+                            "data": {
+                                "channel": format!("order_book_{}", symbol)
+                            }
+                        }).to_string();
                         subscribed_messages.insert(message.clone());
                         websocket_tx.send(Message::Text(message)).await.unwrap();
                     }
@@ -63,10 +115,17 @@ async fn new_message_handler(
             websocket_message = websocket_rx.next() => {
                 match websocket_message {
                     Some(Ok(message)) if message.is_text() => {
-                        info!("Received message from Bitstamp: {}", message.to_string());
+                        match parse_exchange_message(&message) {
+                            Some(message) => {
+                                trace!("Received message from Bitstamp: {:?}", message);
+                            }
+                            None => {
+                                warn!("Unknown message received from Bitstamp: {}", message.to_string());
+                            }
+                        }
                     }
                     Some(Ok(message)) => {
-                        warn!("None text message received from Bitstamp: {}", message.to_string());
+                        warn!("None text message received from Bitstamp: {:?}", message);
                     }
                     Some(Err(e)) => {
                         error!("Error receiving message from Bitstamp: {e}");
