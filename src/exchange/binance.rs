@@ -1,12 +1,15 @@
 use super::{Command, ExchangeConnection};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use itertools::Itertools;
-use log::{error, info, trace, warn};
+use log::{error, info, warn};
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashSet, time::SystemTime};
 use tokio::{net::TcpStream, select, sync::mpsc};
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    tungstenite::{self, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
 const EXCHANGE_NAME: &str = "binance";
 const WEBSOCKET_URL: &str = "wss://stream.binance.com:9443/stream";
@@ -32,28 +35,10 @@ impl Into<super::Orderbook> for Orderbook {
     fn into(self) -> super::Orderbook {
         super::Orderbook {
             monotonic_counter: self.last_update_id,
-            microtimestamp: None,
             bids: self.bids,
             asks: self.asks,
         }
     }
-}
-
-/// Orderbook diff update
-#[derive(Debug, Deserialize)]
-struct OrderbookDiff {
-    #[serde(rename = "E")]
-    _event_timestamp: u64,
-    #[serde(rename = "s")]
-    _instrument_id: String,
-    #[serde(rename = "U")]
-    _first_update_id: u64,
-    #[serde(rename = "u")]
-    _last_update_id: u64,
-    #[serde(rename = "b")]
-    _bids: Vec<[String; 2]>,
-    #[serde(rename = "a")]
-    _asks: Vec<[String; 2]>,
 }
 
 /// Binance websocket message types
@@ -61,12 +46,21 @@ struct OrderbookDiff {
 enum ExchangeMessage {
     /// Orderbook update
     Orderbook(String, Orderbook),
+}
 
-    /// Orderbook diff update
-    OrderbookDiff(OrderbookDiff),
-
-    /// Successful subscription message containing the channel name
-    _SubscriptionSucceeded(String),
+impl Into<super::ExchangeMessage> for ExchangeMessage {
+    /// Converts exchange message to `super::ExchangeMessage`
+    fn into(self) -> super::ExchangeMessage {
+        match self {
+            ExchangeMessage::Orderbook(instrument_id, orderbook) => {
+                super::ExchangeMessage::Orderbook(
+                    EXCHANGE_NAME.to_string(),
+                    instrument_id,
+                    orderbook.into(),
+                )
+            }
+        }
+    }
 }
 
 /// Binance websocket connection
@@ -130,15 +124,77 @@ fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
                 orderbook,
             ))
         }
-        Some("depth") => {
-            let orderbook_diff: OrderbookDiff = serde_json::from_value(data).ok()?;
-            Some(ExchangeMessage::OrderbookDiff(orderbook_diff))
-        }
         _ => None,
     }
 }
 
-/// Event loop for handling websocket messages and exchange commands
+/// Processes exchange command
+///
+/// # Arguments
+/// * `command` - Exchange command
+/// * `websocket_tx` - Websocket sink
+/// * `subscribed_channels` - Set of subscribed channels
+///
+/// # Returns
+/// * `Result<(), tungstenite::Error>` - Result
+async fn process_exchange_command(
+    command: Command,
+    websocket_tx: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    subscribed_channels: &mut HashSet<String>,
+) -> Result<(), tungstenite::Error> {
+    match command {
+        Command::SubscribeOrderbook(instrument_id) => {
+            info!("Subscribing to {instrument_id} orderbook on Binance");
+            let channels = vec![
+                // format!("{instrument_id}@depth@100ms"),
+                // format!("{instrument_id}@depth10@100ms"),
+                format!("{instrument_id}@depth20@100ms"),
+            ];
+            channels.iter().for_each(|channel| {
+                subscribed_channels.insert(channel.to_string());
+            });
+            websocket_tx
+                .send(Message::Text(new_subscribe_message(channels)))
+                .await
+        }
+    }
+}
+
+/// Processes websocket message
+///
+/// # Arguments
+/// * `websocket_message` - Websocket message
+/// * `exchange_message_tx` - Channel to send exchange messages to
+///
+/// # Returns
+/// * `Result<(), tungstenite::Error>` - Result
+async fn process_websocket_message(
+    websocket_message: Option<Result<Message, tungstenite::Error>>,
+    exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
+) -> Result<(), tungstenite::Error> {
+    match websocket_message {
+        Some(Ok(message)) if message.is_text() => {
+            match parse_exchange_message(&message) {
+                Some(message) => exchange_message_tx.send(message.into()).unwrap(),
+                None => info!("Message received from Binance: {message}"),
+            }
+            Ok(())
+        }
+        Some(Ok(message)) => {
+            if message.is_ping() {
+                info!("Ping message: {}", message.to_string());
+            } else {
+                warn!("None text message received from Binance: {message:?}");
+            }
+            Ok(())
+        }
+        Some(Err(e)) => Err(e),
+        None => Err(tungstenite::Error::ConnectionClosed),
+    }
+}
+
+/// Event loop for handling websocket messages and exchange commands.
+/// Terminates when websocket connection is closed or an error occurs
 ///
 /// # Arguments
 /// * `subscribed_channels` - Set of subscribed channels
@@ -172,57 +228,15 @@ async fn new_message_handler(
                 websocket_tx.send(PONG_MESSAGE).await.unwrap();
             }
             Some(command) = command_rx.recv() => {
-                match command {
-                    Command::SubscribeOrderbook(instrument_id) => {
-                        info!("Subscribing to {instrument_id} orderbook on Binance");
-                        let channels = vec![
-                            format!("{instrument_id}@depth@100ms"),
-                            format!("{instrument_id}@depth10@100ms"),
-                            format!("{instrument_id}@depth20@100ms")
-                        ];
-                        channels.iter().for_each(|channel| {
-                            subscribed_channels.insert(channel.to_string());
-                        });
-                        websocket_tx.send(Message::Text(
-                            new_subscribe_message(channels)
-                        )).await.unwrap();
-                    }
+                if let Err(e) = process_exchange_command(command, &mut websocket_tx, subscribed_channels).await {
+                    error!("Error processing exchange command: {e}");
+                    return
                 }
             }
             websocket_message = websocket_rx.next() => {
-                match websocket_message {
-                    Some(Ok(message)) if message.is_text() => {
-                        match parse_exchange_message(&message) {
-                            Some(message) => {
-                                if let ExchangeMessage::Orderbook(instrument_id, orderbook) = message {
-                                    exchange_message_tx.send(super::ExchangeMessage::Orderbook(
-                                        EXCHANGE_NAME.to_string(),
-                                        instrument_id,
-                                        orderbook.into()
-                                    )).unwrap();
-                                } else {
-                                    trace!("Received message from Binance: {message:?}")
-                                }
-                            },
-                            None => {
-                                warn!("Unknown message received from Binance: {message:?}");
-                            }
-                        }
-                    }
-                    Some(Ok(message)) => {
-                        warn!("None text message received from Binance: {message:?}");
-                        if message.is_ping() {
-                            info!("Ping message: {}", message.to_string());
-                        }
-                    }
-                    Some(Err(e)) => {
-                        error!("Error receiving message from Binance: {e}");
-                        break;
-                    }
-                    None => {
-                        error!("Binance closed connection");
-                        break;
-                    }
+                if let Err(e) = process_websocket_message(websocket_message, exchange_message_tx).await {
+                    error!("Error processing websocket message: {e}");
+                    return
                 }
             }
         }

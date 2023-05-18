@@ -3,6 +3,25 @@ use tokio::sync::mpsc;
 pub mod binance;
 pub mod bitstamp;
 
+#[derive(Debug)]
+pub struct Orderbook {
+    /// Monotonic counter
+    monotonic_counter: u64,
+
+    /// Bids represented as `[[price, amount], ...]`
+    bids: Vec<[String; 2]>,
+
+    /// Asks represented as `[[price, amount], ...]`
+    asks: Vec<[String; 2]>,
+}
+
+impl Orderbook {
+    /// Returns true if the orderbook is newer than the other orderbook
+    pub fn is_newer_than(&self, other: &Orderbook) -> bool {
+        self.monotonic_counter > other.monotonic_counter
+    }
+}
+
 /// Exchange connection commands
 #[derive(Debug)]
 enum Command {
@@ -15,21 +34,6 @@ enum Command {
 pub enum ExchangeMessage {
     /// Represent an orderbook as `(exchange_name, instrument_id, orderbook)`
     Orderbook(String, String, Orderbook),
-}
-
-#[derive(Debug)]
-pub struct Orderbook {
-    /// Monotonic counter
-    monotonic_counter: u64,
-
-    /// Microtimestamp of the orderbook
-    microtimestamp: Option<u64>,
-
-    /// Bids represented as `[[price, amount], ...]`
-    bids: Vec<[String; 2]>,
-
-    /// Asks represented as `[[price, amount], ...]`
-    asks: Vec<[String; 2]>,
 }
 
 /// Exchange connection trait

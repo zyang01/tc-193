@@ -1,11 +1,14 @@
 use super::{Command, ExchangeConnection};
-use futures_util::{SinkExt, StreamExt};
-use log::{error, info, trace, warn};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use log::{error, info, warn};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
 use tokio::{net::TcpStream, select, sync::mpsc};
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    tungstenite::{self, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
 const EXCHANGE_NAME: &str = "bitstamp";
 const WEBSOCKET_URL: &str = "wss://ws.bitstamp.net";
@@ -15,8 +18,6 @@ const HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 /// Orderbook update
 #[derive(Debug, Deserialize)]
 struct Orderbook {
-    #[serde(rename = "timestamp")]
-    _timestamp: String,
     microtimestamp: String,
 
     /// Bids represented as `[[price, amount], ...]`
@@ -32,24 +33,35 @@ impl Into<super::Orderbook> for Orderbook {
         let microtimestamp = self.microtimestamp.parse::<u64>().unwrap();
         super::Orderbook {
             monotonic_counter: microtimestamp,
-            microtimestamp: Some(microtimestamp),
             bids: self.bids,
             asks: self.asks,
         }
     }
 }
 
-/// Bitsamp websocket message types
+/// Bitstamp websocket message types
 #[derive(Debug)]
 enum ExchangeMessage {
     /// Orderbook update
     Orderbook(String, Orderbook),
-
-    /// Successful subscription message containing the channel name
-    SubscriptionSucceeded(String),
 }
 
-/// Bitsamp websocket connection
+impl Into<super::ExchangeMessage> for ExchangeMessage {
+    /// Converts websocket message to `super::ExchangeMessage`
+    fn into(self) -> super::ExchangeMessage {
+        match self {
+            ExchangeMessage::Orderbook(instrument_id, orderbook) => {
+                super::ExchangeMessage::Orderbook(
+                    EXCHANGE_NAME.to_string(),
+                    instrument_id,
+                    orderbook.into(),
+                )
+            }
+        }
+    }
+}
+
+/// Bitstamp websocket connection
 pub struct BitstampConnection {
     /// Channel to send commands to
     command_tx: mpsc::UnboundedSender<Command>,
@@ -88,14 +100,71 @@ fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
             let instrument_id = channel.split("_").last()?.to_string();
             Some(ExchangeMessage::Orderbook(instrument_id, orderbook))
         }
-        "bts:subscription_succeeded" => {
-            Some(ExchangeMessage::SubscriptionSucceeded(channel.to_string()))
-        }
         _ => None,
     }
 }
 
-/// Event loop for handling websocket messages and exchange commands
+/// Processes exchange commands
+///
+/// # Arguments
+/// * `command` - Exchange command
+/// * `websocket_tx` - Websocket sink
+/// * `subscribed_messages` - Set of subscribed messages
+///
+/// # Returns
+/// * `Result<(), tungstenite::Error>` - Result
+async fn process_exchange_command(
+    command: Command,
+    websocket_tx: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    subscribed_messages: &mut HashSet<String>,
+) -> Result<(), tungstenite::Error> {
+    match command {
+        Command::SubscribeOrderbook(instrument_id) => {
+            info!("Subscribing to {instrument_id} orderbook on Bitstamp");
+            let message = json!({
+                "event": "bts:subscribe",
+                "data": {
+                    "channel": format!("order_book_{instrument_id}")
+                }
+            })
+            .to_string();
+            subscribed_messages.insert(message.clone());
+            websocket_tx.send(Message::Text(message)).await
+        }
+    }
+}
+
+/// Processes websocket messages
+///
+/// # Arguments
+/// * `websocket_message` - Websocket message
+/// * `exchange_message_tx` - Channel to send exchange messages to
+///
+/// # Returns
+/// * `Result<(), tungstenite::Error>` - Result
+async fn process_websocket_message(
+    websocket_message: Option<Result<Message, tungstenite::Error>>,
+    exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
+) -> Result<(), tungstenite::Error> {
+    match websocket_message {
+        Some(Ok(message)) if message.is_text() => {
+            match parse_exchange_message(&message) {
+                Some(message) => exchange_message_tx.send(message.into()).unwrap(),
+                None => info!("Message received from Bitstamp: {message}"),
+            }
+            Ok(())
+        }
+        Some(Ok(message)) => {
+            warn!("None text message received from Bitstamp: {:?}", message);
+            Ok(())
+        }
+        Some(Err(e)) => Err(e),
+        None => Err(tungstenite::Error::ConnectionClosed),
+    }
+}
+
+/// Event loop for handling websocket messages and exchange commands.
+/// Terminates when websocket connection is closed or an error occurs
 ///
 /// # Arguments
 /// * `subscribed_channels` - Set of subscribed channels
@@ -126,55 +195,20 @@ async fn new_message_handler(
             _ = heartbeat_interval.tick() => {
                 let message = json!({
                     "event": "bts:heartbeat",
-                }).to_string();
+                })
+                .to_string();
                 websocket_tx.send(Message::Text(message)).await.unwrap();
             }
             Some(command) = command_rx.recv() => {
-                match command {
-                    Command::SubscribeOrderbook(instrument_id) => {
-                        info!("Subscribing to {instrument_id} orderbook on Bitstamp");
-                        let message = json!({
-                            "event": "bts:subscribe",
-                            "data": {
-                                "channel": format!("order_book_{instrument_id}")
-                            }
-                        }).to_string();
-                        subscribed_messages.insert(message.clone());
-                        websocket_tx.send(Message::Text(message)).await.unwrap();
-                    }
+                if let Err(e) = process_exchange_command(command, &mut websocket_tx, subscribed_messages).await {
+                    error!("Error processing exchange command: {e}");
+                    return
                 }
             }
             websocket_message = websocket_rx.next() => {
-                match websocket_message {
-                    Some(Ok(message)) if message.is_text() => {
-                        match parse_exchange_message(&message) {
-                            Some(message) => {
-                                if let ExchangeMessage::Orderbook(instrument_id, orderbook) = message {
-                                    exchange_message_tx.send(super::ExchangeMessage::Orderbook(
-                                        EXCHANGE_NAME.to_string(),
-                                        instrument_id,
-                                        orderbook.into(),
-                                    )).unwrap();
-                                } else {
-                                    trace!("Received message from Bitstamp: {:?}", message);
-                                }
-                            }
-                            None => {
-                                warn!("Unknown message received from Bitstamp: {}", message.to_string());
-                            }
-                        }
-                    }
-                    Some(Ok(message)) => {
-                        warn!("None text message received from Bitstamp: {:?}", message);
-                    }
-                    Some(Err(e)) => {
-                        error!("Error receiving message from Bitstamp: {e}");
-                        break;
-                    }
-                    None => {
-                        error!("Bitstamp closed connection");
-                        break;
-                    }
+                if let Err(e) = process_websocket_message(websocket_message, exchange_message_tx).await {
+                    error!("Error processing websocket message: {e}");
+                    return
                 }
             }
         }
