@@ -29,6 +29,9 @@ struct Orderbook {
 
 impl Into<super::Orderbook> for Orderbook {
     /// Converts orderbook to `super::Orderbook`
+    ///
+    /// # Panics
+    /// Panics if `microtimestamp` cannot be parsed as `u64`
     fn into(self) -> super::Orderbook {
         let microtimestamp = self.microtimestamp.parse::<u64>().unwrap();
         super::Orderbook {
@@ -68,6 +71,13 @@ pub struct BitstampConnection {
 }
 
 impl ExchangeConnection for BitstampConnection {
+    /// Subscribes to orderbook updates for an instrument id
+    ///
+    /// # Arguments
+    /// * `instrument_id` - Instrument id to subscribe to
+    ///
+    /// # Panics
+    /// Panics if `command_tx` is closed
     fn subscribe_orderbook(&mut self, instrument_id: &str) {
         info!("Subscribing to {instrument_id} on Bitstamp");
         self.command_tx
@@ -142,6 +152,9 @@ async fn process_exchange_command(
 ///
 /// # Returns
 /// * `Result<(), tungstenite::Error>` - Result
+///
+/// # Panics
+/// Panics if `exchange_message_tx` is closed
 async fn process_websocket_message(
     websocket_message: Option<Result<Message, tungstenite::Error>>,
     exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
@@ -181,10 +194,10 @@ async fn new_message_handler(
 
     for message in subscribed_messages.iter() {
         info!("Resubscribing to {}", message);
-        websocket_tx
-            .send(Message::Text(message.clone()))
-            .await
-            .unwrap();
+        if let Err(e) = websocket_tx.send(Message::Text(message.clone())).await {
+            error!("Error resubscribing to {message}: {e}");
+            return;
+        }
     }
 
     let mut heartbeat_interval =
@@ -197,7 +210,11 @@ async fn new_message_handler(
                     "event": "bts:heartbeat",
                 })
                 .to_string();
-                websocket_tx.send(Message::Text(message)).await.unwrap();
+
+                if let Err(e) = websocket_tx.send(Message::Text(message)).await {
+                    error!("Error sending heartbeat: {e}");
+                    return;
+                }
             }
             Some(command) = command_rx.recv() => {
                 if let Err(e) = process_exchange_command(command, &mut websocket_tx, subscribed_messages).await {
@@ -220,6 +237,9 @@ async fn new_message_handler(
 /// # Arguments
 /// * `command_rx` - Channel to receive commands from
 /// * `exchange_message_tx` - Channel to send exchange messages to
+///
+/// # Panics
+/// Panics if `WEB_SOCKET_URL` cannot be parsed as a url
 async fn new_connection_handler(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     mut exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>,

@@ -70,6 +70,13 @@ pub struct BinanceConnection {
 }
 
 impl ExchangeConnection for BinanceConnection {
+    /// Subscribes to orderbook updates for given instrument
+    ///
+    /// # Arguments
+    /// * `instrument_id` - Instrument id
+    ///
+    /// # Panics
+    /// Panics if `command_tx` is closed
     fn subscribe_orderbook(&mut self, instrument_id: &str) {
         info!("Subscribing to {instrument_id} on Binance");
         self.command_tx
@@ -91,6 +98,9 @@ impl ExchangeConnection for BinanceConnection {
 ///
 /// # Returns
 /// * `String` - Subscribe message
+///
+/// # Panics
+/// Panics if clock is set to before UNIX epoch
 fn new_subscribe_message(channels: Vec<String>) -> String {
     json!({
         "method": "SUBSCRIBE",
@@ -168,6 +178,9 @@ async fn process_exchange_command(
 ///
 /// # Returns
 /// * `Result<(), tungstenite::Error>` - Result
+///
+/// # Panics
+/// Panics if `exchange_message_tx` is closed
 async fn process_websocket_message(
     websocket_message: Option<Result<Message, tungstenite::Error>>,
     exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
@@ -211,12 +224,15 @@ async fn new_message_handler(
 
     if !subscribed_channels.is_empty() {
         info!("Resubscribing to channels: {subscribed_channels:?}");
-        websocket_tx
+        if let Err(e) = websocket_tx
             .send(Message::Text(new_subscribe_message(
                 subscribed_channels.clone().into_iter().collect_vec(),
             )))
             .await
-            .unwrap();
+        {
+            error!("Error resubscribing to channels: {e}");
+            return;
+        }
     }
 
     let mut pong_interval =
@@ -225,7 +241,10 @@ async fn new_message_handler(
     loop {
         select! {
             _ = pong_interval.tick() => {
-                websocket_tx.send(PONG_MESSAGE).await.unwrap();
+                if let Err(e) = websocket_tx.send(PONG_MESSAGE).await {
+                    error!("Error sending pong message: {e}");
+                    return;
+                }
             }
             Some(command) = command_rx.recv() => {
                 if let Err(e) = process_exchange_command(command, &mut websocket_tx, subscribed_channels).await {
@@ -248,6 +267,9 @@ async fn new_message_handler(
 /// # Arguments
 /// * `command_rx` - Channel to receive commands from
 /// * `exchange_message_tx` - Channel to send exchange messages to
+///
+/// # Panics
+/// Panics if `WEB_SOCKET_URL` cannot be parsed as a url
 async fn new_connection_handler(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     mut exchange_message_tx: mpsc::UnboundedSender<super::ExchangeMessage>,
