@@ -302,3 +302,153 @@ async fn new_connection_handler(
         .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example_orderbook_data() -> String {
+        json!({
+            "stream": "btcusdt@depth10@100ms",
+            "data": {
+                "lastUpdateId": 36919621358_i64,
+                "bids": [
+                    [
+                        "26761.47000000",
+                        "0.05065000"
+                    ],
+                    [
+                        "26761.18000000",
+                        "0.00069000"
+                    ],
+                    [
+                        "26761.06000000",
+                        "0.00038000"
+                    ],
+                    [
+                        "26760.96000000",
+                        "0.35058000"
+                    ],
+                    [
+                        "26760.81000000",
+                        "0.00069000"
+                    ],
+                    [
+                        "26760.68000000",
+                        "0.00044000"
+                    ],
+                    [
+                        "26760.58000000",
+                        "0.00067000"
+                    ],
+                    [
+                        "26760.30000000",
+                        "1.57365000"
+                    ],
+                    [
+                        "26760.00000000",
+                        "0.09339000"
+                    ],
+                    [
+                        "26759.55000000",
+                        "0.00200000"
+                    ]
+                ],
+                "asks": [
+                    [
+                        "26761.48000000",
+                        "5.97881000"
+                    ],
+                    [
+                        "26761.51000000",
+                        "0.68135000"
+                    ],
+                    [
+                        "26761.56000000",
+                        "0.93394000"
+                    ],
+                    [
+                        "26761.92000000",
+                        "0.37271000"
+                    ],
+                    [
+                        "26762.07000000",
+                        "0.78350000"
+                    ],
+                    [
+                        "26762.08000000",
+                        "0.77330000"
+                    ],
+                    [
+                        "26762.29000000",
+                        "0.00069000"
+                    ],
+                    [
+                        "26762.30000000",
+                        "0.09047000"
+                    ],
+                    [
+                        "26762.37000000",
+                        "0.06165000"
+                    ],
+                    [
+                        "26762.38000000",
+                        "0.16147000"
+                    ]
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn can_parse_exchange_message() {
+        let websocket_message = example_orderbook_data();
+
+        if let Some(ExchangeMessage::Orderbook(instrument_id, orderbook)) =
+            parse_exchange_message(&websocket_message.into())
+        {
+            assert_eq!(instrument_id, "btcusdt");
+            assert_eq!(orderbook.last_update_id, 36919621358);
+
+            assert_eq!(orderbook.bids.len(), 10);
+            assert_eq!(orderbook.bids[0], ["26761.47000000", "0.05065000"]);
+
+            assert_eq!(orderbook.asks.len(), 10);
+            assert_eq!(orderbook.asks[0], ["26761.48000000", "5.97881000"]);
+        } else {
+            panic!("Could not parse exchange message")
+        }
+    }
+
+    #[test]
+    fn cannot_parse_exchange_message() {
+        let websocket_message = json!({
+            "result": null,
+            "id": 1
+        })
+        .to_string();
+
+        assert!(parse_exchange_message(&websocket_message.into()).is_none());
+    }
+
+    #[test]
+    fn can_convert_orderbook() {
+        if let Some(ExchangeMessage::Orderbook(instrument_id, orderbook)) =
+            parse_exchange_message(&example_orderbook_data().into())
+        {
+            let orderbook: super::super::Orderbook = orderbook.into();
+
+            assert_eq!(instrument_id, "btcusdt");
+            assert_eq!(orderbook.monotonic_counter, 36919621358);
+
+            assert_eq!(orderbook.bids.len(), 10);
+            assert_eq!(orderbook.bids[0], ["26761.47000000", "0.05065000"]);
+
+            assert_eq!(orderbook.asks.len(), 10);
+            assert_eq!(orderbook.asks[0], ["26761.48000000", "5.97881000"]);
+        } else {
+            panic!("Could not parse exchange message")
+        }
+    }
+}

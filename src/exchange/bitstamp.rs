@@ -1,6 +1,6 @@
 use super::{Command, ExchangeConnection};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -168,7 +168,11 @@ async fn process_websocket_message(
             Ok(())
         }
         Some(Ok(message)) => {
-            warn!("None text message received from Bitstamp: {:?}", message);
+            if !message.is_ping() {
+                warn!("None text message received from Bitstamp: {:?}", message);
+            } else {
+                debug!("Ping received from Bitstamp");
+            }
             Ok(())
         }
         Some(Err(e)) => Err(e),
@@ -268,5 +272,97 @@ async fn new_connection_handler(
             &mut exchange_message_tx,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn example_orderbook_data() -> String {
+        json!({
+            "data": {
+                "timestamp": "1684702465",
+                "microtimestamp": "1684702465409171",
+                "bids": [
+                    [
+                        "26847",
+                        "0.00250654"
+                    ],
+                    [
+                        "26846",
+                        "0.00713821"
+                    ],
+                ],
+                "asks": [
+                    [
+                        "26849",
+                        "0.65179336"
+                    ],
+                    [
+                        "26850",
+                        "0.60947032"
+                    ],
+                ]
+            },
+            "channel": "order_book_btcusd",
+            "event": "data"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn cannot_parse_exchange_message() {
+        let websocket_message = json!({
+            "event": "bts:subscribe",
+            "data": {
+                "channel": "order_book_btcusd"
+            }
+        })
+        .to_string();
+
+        if parse_exchange_message(&websocket_message.into()).is_some() {
+            panic!("Should not parse exchange message");
+        }
+    }
+
+    #[test]
+    fn can_parse_exchange_message() {
+        let websocket_message = example_orderbook_data();
+
+        if let Some(ExchangeMessage::Orderbook(instrument_id, orderbook)) =
+            parse_exchange_message(&websocket_message.into())
+        {
+            assert_eq!(instrument_id, "btcusd");
+            assert_eq!(orderbook.microtimestamp, "1684702465409171");
+
+            assert_eq!(orderbook.bids.len(), 2);
+            assert_eq!(orderbook.bids[0], ["26847", "0.00250654"]);
+            assert_eq!(orderbook.bids[1], ["26846", "0.00713821"]);
+
+            assert_eq!(orderbook.asks.len(), 2);
+            assert_eq!(orderbook.asks[0], ["26849", "0.65179336"]);
+            assert_eq!(orderbook.asks[1], ["26850", "0.60947032"]);
+        } else {
+            panic!("Could not parse exchange message");
+        }
+    }
+
+    #[test]
+    fn can_convert_orderbook() {
+        let orderbook = Orderbook {
+            microtimestamp: "1684702465409171".to_string(),
+            bids: vec![["26847".to_string(), "0.00250654".to_string()]],
+            asks: vec![["26849".to_string(), "0.65179336".to_string()]],
+        };
+
+        let orderbook: super::super::Orderbook = orderbook.into();
+
+        assert_eq!(orderbook.monotonic_counter, 1684702465409171);
+        assert_eq!(orderbook.bids.len(), 1);
+        assert_eq!(orderbook.bids[0], ["26847", "0.00250654"]);
+        assert_eq!(orderbook.asks.len(), 1);
+        assert_eq!(orderbook.asks[0], ["26849", "0.65179336"]);
     }
 }
