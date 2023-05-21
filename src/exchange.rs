@@ -9,10 +9,10 @@ pub struct Orderbook {
     monotonic_counter: u64,
 
     /// Bids represented as `[[price, amount], ...]`
-    bids: Vec<[String; 2]>,
+    pub bids: Vec<[String; 2]>,
 
     /// Asks represented as `[[price, amount], ...]`
-    asks: Vec<[String; 2]>,
+    pub asks: Vec<[String; 2]>,
 }
 
 impl Orderbook {

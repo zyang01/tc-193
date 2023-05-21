@@ -147,8 +147,8 @@ async fn process_exchange_command(
             info!("Subscribing to {instrument_id} orderbook on Binance");
             let channels = vec![
                 // format!("{instrument_id}@depth@100ms"),
-                // format!("{instrument_id}@depth10@100ms"),
-                format!("{instrument_id}@depth20@100ms"),
+                format!("{instrument_id}@depth10@100ms"),
+                // format!("{instrument_id}@depth20@100ms"),
             ];
             channels.iter().for_each(|channel| {
                 subscribed_channels.insert(channel.to_string());
