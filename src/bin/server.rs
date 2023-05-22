@@ -29,6 +29,7 @@ pub struct GrpcServer {
 
 impl GrpcServer {
     pub fn new() -> Self {
+        // create and store broadcast channel
         let (tx, rx) = broadcast::channel(BROADCAST_CHANNEL_BUFFER_SIZE);
         Self {
             broadcast_tx: tx,
@@ -54,6 +55,7 @@ impl OrderbookAggregator for GrpcServer {
             BroadcastStream::new(broadcast_rx).filter_map(|message| match message {
                 Ok(summary) => Some(Ok(summary)),
                 Err(BroadcastStreamRecvError::Lagged(_)) => {
+                    // warn and skip lagged messages
                     warn!("Broadcast stream lagged");
                     None
                 }
@@ -73,6 +75,7 @@ impl OrderbookAggregator for GrpcServer {
 /// Panics if broadcast_tx is closed or if any of the price or amount fields in the orderbook
 /// updates cannot be parsed as floats
 async fn book_summary_broadcaster(broadcast_tx: Sender<Summary>, instrument_ids: Vec<String>) {
+    // setup websocket connections to exchanges
     let (exchange_message_tx, mut exchange_message_rx) =
         mpsc::unbounded_channel::<ExchangeMessage>();
 
@@ -92,6 +95,8 @@ async fn book_summary_broadcaster(broadcast_tx: Sender<Summary>, instrument_ids:
         let instrument_orderbooks = orderbooks
             .entry(instrument_id.clone())
             .or_insert_with(HashMap::new);
+
+        // convert and store orderbook levels
         instrument_orderbooks.insert(
             exchange_name.clone(),
             (
@@ -116,6 +121,7 @@ async fn book_summary_broadcaster(broadcast_tx: Sender<Summary>, instrument_ids:
             ),
         );
 
+        // merge orderbook best bids and asks
         let bids = instrument_orderbooks
             .iter()
             .map(|(_, (bids, _))| bids.clone())
@@ -130,6 +136,7 @@ async fn book_summary_broadcaster(broadcast_tx: Sender<Summary>, instrument_ids:
             .take(LEVELS_TO_TAKE)
             .collect_vec();
 
+        // broadcast summary only if there is a best bid and ask
         if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
             broadcast_tx
                 .send(Summary {
