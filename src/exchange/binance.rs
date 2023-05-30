@@ -1,7 +1,7 @@
 use super::{Command, ExchangeConnection};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use itertools::Itertools;
-use log::{debug, error, info, warn};
+use itertools::{EitherOrBoth, Itertools};
+use log::{debug, error, info, trace, warn};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -39,6 +39,50 @@ struct Orderbook {
 impl Orderbook {
     fn merge_diff(&mut self, orderbook_diff: OrderbookDiff) {
         // merge orderbook diff into orderbook
+        self.bids = self
+            .bids
+            .iter()
+            .merge_join_by(orderbook_diff.bids.iter(), |bid, bid_diff| {
+                bid_diff[0]
+                    .parse::<f64>()
+                    .unwrap()
+                    .partial_cmp(&bid[0].parse::<f64>().unwrap())
+                    .unwrap()
+            })
+            .filter_map(|join_result| match join_result {
+                EitherOrBoth::Left(bid) => Some(bid.clone()),
+                EitherOrBoth::Right(bid_diff) | EitherOrBoth::Both(_, bid_diff) => {
+                    if bid_diff[1].parse::<f64>().unwrap() == 0. {
+                        None
+                    } else {
+                        Some(bid_diff.clone())
+                    }
+                }
+            })
+            .collect();
+
+        self.asks = self
+            .asks
+            .iter()
+            .merge_join_by(orderbook_diff.asks.iter(), |ask, ask_diff| {
+                ask[0]
+                    .parse::<f64>()
+                    .unwrap()
+                    .partial_cmp(&ask_diff[0].parse::<f64>().unwrap())
+                    .unwrap()
+            })
+            .filter_map(|join_result| match join_result {
+                EitherOrBoth::Left(ask) => Some(ask.clone()),
+                EitherOrBoth::Right(ask_diff) | EitherOrBoth::Both(_, ask_diff) => {
+                    if ask_diff[1].parse::<f64>().unwrap() == 0. {
+                        None
+                    } else {
+                        Some(ask_diff.clone())
+                    }
+                }
+            })
+            .collect();
+
         self.last_update_id = orderbook_diff.last_update_id;
     }
 }
@@ -54,11 +98,11 @@ struct OrderbookDiff {
 
     /// Bids represented as `[[price, amount], ...]`
     #[serde(rename = "b")]
-    _bids: Vec<[String; 2]>,
+    bids: Vec<[String; 2]>,
 
     /// Asks represented as `[[price, amount], ...]`
     #[serde(rename = "a")]
-    _asks: Vec<[String; 2]>,
+    asks: Vec<[String; 2]>,
 }
 
 impl Into<super::Orderbook> for Orderbook {
@@ -197,7 +241,7 @@ fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
             let orderbook_diff: OrderbookDiff = serde_json::from_value(data).ok()?;
             Some(ExchangeMessage::OrderbookDiff(
                 instrument_id?.to_string(),
-                stream_name?.to_string(),
+                stream.to_string(),
                 orderbook_diff,
             ))
         }
@@ -224,8 +268,8 @@ async fn process_exchange_command(
             info!("Subscribing to {instrument_id} orderbook on Binance");
             let channels = vec![
                 format!("{instrument_id}@depth@100ms"),
-                // format!("{instrument_id}@depth10@100ms"),
-                // format!("{instrument_id}@depth20@100ms"),
+                format!("{instrument_id}@depth10@100ms"),
+                format!("{instrument_id}@depth20@100ms"),
             ];
             channels.iter().for_each(|channel| {
                 subscribed_channels.insert(channel.to_string());
@@ -237,11 +281,109 @@ async fn process_exchange_command(
     }
 }
 
+/// Processes orderbook diff
+/// Merge orderbook diff into orderbook if possible, otherwise cache orderbook diff and request
+/// orderbook via get request if not already in progress
+///
+/// # Arguments
+/// * `instrument_id` - Instrument id
+/// * `stream_name` - Stream name
+/// * `orderbook_diff` - Orderbook diff
+/// * `orderbooks_cache` - Orderbook cache
+/// * `orderbook_diff_cache` - Orderbook diff cache
+/// * `orderbook_get_requests` - Orderbook get requests
+async fn process_orderbook_diff(
+    instrument_id: String,
+    stream_name: String,
+    orderbook_diff: OrderbookDiff,
+    orderbooks_cache: &mut HashMap<String, Orderbook>,
+    orderbook_diff_cache: &mut HashMap<String, VecDeque<OrderbookDiff>>,
+    orderbook_get_requests: &mut HashMap<String, JoinHandle<Result<Orderbook, reqwest::Error>>>,
+) {
+    if orderbooks_cache
+        .get(&stream_name)
+        .map_or(false, |orderbook| {
+            orderbook.last_update_id + 1 == orderbook_diff.first_update_id
+        })
+    {
+        // merge orderbook diff into orderbook
+        let orderbook = orderbooks_cache.get_mut(&stream_name).unwrap();
+        orderbook.merge_diff(orderbook_diff);
+        trace!(
+            "merged orderbook diff into orderbook for {}",
+            orderbook.last_update_id
+        );
+        return;
+    }
+
+    // cache orderbook diff
+    orderbook_diff_cache
+        .entry(stream_name.clone())
+        .or_insert_with(VecDeque::new)
+        .push_back(orderbook_diff);
+
+    // orderbook cache is not up to date, request or wait for orderbook via get request
+    match orderbook_get_requests.get_mut(&stream_name) {
+        Some(request) if request.is_finished() => {
+            if let Ok(Ok(mut orderbook)) = request.await {
+                debug!(
+                    "orderbook get request finished for {}",
+                    orderbook.last_update_id
+                );
+                // remove request
+                orderbook_get_requests.remove(&stream_name);
+
+                let merge_success = orderbook_diff_cache
+                    .get_mut(&stream_name)
+                    .unwrap()
+                    .drain(..)
+                    .fold(false, |valid, diff| {
+                        if (valid && orderbook.last_update_id + 1 == diff.first_update_id)
+                            || (!valid
+                                && diff.first_update_id <= orderbook.last_update_id + 1
+                                && orderbook.last_update_id < diff.last_update_id)
+                        {
+                            orderbook.merge_diff(diff);
+                            true
+                        } else {
+                            debug!(
+                                "discarding orderbook diff for {}->{}",
+                                diff.first_update_id, diff.last_update_id
+                            );
+                            false
+                        }
+                    });
+                debug!(
+                    "merge result: {} {}",
+                    merge_success, orderbook.last_update_id
+                );
+                orderbooks_cache.insert(stream_name, orderbook);
+            } else {
+                // remove errored request
+                orderbook_get_requests.remove(&stream_name);
+            }
+        }
+        Some(_) => {
+            // request in progress, do nothing
+        }
+        _ => {
+            orderbook_get_requests.insert(
+                stream_name,
+                tokio::spawn(get_orderbook_depth(instrument_id)),
+            );
+        }
+    }
+}
+
 /// Processes websocket message
 ///
 /// # Arguments
 /// * `websocket_message` - Websocket message
 /// * `exchange_message_tx` - Channel to send exchange messages to
+/// * `orderbooks_cache` - Orderbook cache
+/// * `latest_orderbook_update_id` - Latest orderbook update id
+/// * `orderbook_diff_cache` - Orderbook diff cache
+/// * `orderbook_get_requests` - Orderbook get requests
 ///
 /// # Returns
 /// * `Result<(), tungstenite::Error>` - Result
@@ -264,80 +406,46 @@ async fn process_websocket_message(
                     stream_name,
                     orderbook_diff,
                 )) => {
-                    debug!(
+                    trace!(
                         "orderbook diff received from for {instrument_id} {}->{}",
-                        orderbook_diff.first_update_id, orderbook_diff.last_update_id
+                        orderbook_diff.first_update_id,
+                        orderbook_diff.last_update_id
                     );
+                    process_orderbook_diff(
+                        instrument_id.to_string(),
+                        stream_name.to_string(),
+                        orderbook_diff,
+                        orderbooks_cache,
+                        orderbook_diff_cache,
+                        orderbook_get_requests,
+                    )
+                    .await;
 
-                    if orderbooks_cache
-                        .get(&stream_name)
-                        .map_or(false, |orderbook| {
-                            orderbook.last_update_id + 1 == orderbook_diff.first_update_id
-                        })
-                    {
-                        // merge orderbook diff into orderbook
-                        let orderbook = orderbooks_cache.get_mut(&stream_name).unwrap();
-                        orderbook.merge_diff(orderbook_diff);
-                        debug!(
-                            "merged orderbook diff into orderbook for {}",
-                            orderbook.last_update_id
-                        );
-                    } else {
-                        // cache orderbook diff
-                        orderbook_diff_cache
-                            .entry(stream_name.clone())
-                            .or_insert_with(VecDeque::new)
-                            .push_back(orderbook_diff);
+                    if let Some(orderbook) = orderbooks_cache.get(&stream_name) {
+                        // check if orderbook is newer than cached orderbook
+                        if latest_orderbook_update_id
+                            .get(&instrument_id)
+                            .map_or(true, |prev_update_id| {
+                                orderbook.last_update_id > *prev_update_id
+                            })
+                        {
+                            debug!(
+                                "latest orderbook received from {stream_name} for {instrument_id} with update id {}: {:?} {:?}",
+                                orderbook.last_update_id, orderbook.bids[0], orderbook.asks[0]
+                            );
+                            exchange_message_tx
+                                .send(
+                                    ExchangeMessage::Orderbook(
+                                        instrument_id.to_string(),
+                                        stream_name.to_string(),
+                                        orderbook.clone(),
+                                    )
+                                    .into(),
+                                )
+                                .unwrap();
 
-                        // orderbook cache is not up to date, request orderbook
-                        match orderbook_get_requests.get_mut(&stream_name) {
-                            Some(request) if request.is_finished() => {
-                                if let Ok(Ok(mut orderbook)) = request.await {
-                                    debug!(
-                                        "orderbook get request finished for {}",
-                                        orderbook.last_update_id
-                                    );
-                                    orderbook_get_requests.remove(&stream_name);
-                                    let merge_success = orderbook_diff_cache
-                                        .get_mut(&stream_name)
-                                        .unwrap()
-                                        .drain(..)
-                                        .fold(false, |valid, diff| {
-                                            if valid
-                                                && orderbook.last_update_id + 1
-                                                    == diff.first_update_id
-                                            {
-                                                orderbook.merge_diff(diff);
-                                                true
-                                            } else if !valid
-                                                && diff.first_update_id
-                                                    <= orderbook.last_update_id + 1
-                                                && orderbook.last_update_id < diff.last_update_id
-                                            {
-                                                orderbook.merge_diff(diff);
-                                                true
-                                            } else {
-                                                debug!(
-                                                    "discarding orderbook diff for {}->{}",
-                                                    diff.first_update_id, diff.last_update_id
-                                                );
-                                                false
-                                            }
-                                        });
-                                    debug!(
-                                        "merge result: {} {}",
-                                        merge_success, orderbook.last_update_id
-                                    );
-                                    orderbooks_cache.insert(stream_name, orderbook);
-                                }
-                            }
-                            Some(_) => {}
-                            _ => {
-                                orderbook_get_requests.insert(
-                                    stream_name,
-                                    tokio::spawn(get_orderbook_depth(instrument_id)),
-                                );
-                            }
+                            latest_orderbook_update_id
+                                .insert(instrument_id.clone(), orderbook.last_update_id);
                         }
                     }
                 }
@@ -349,7 +457,10 @@ async fn process_websocket_message(
                             orderbook.last_update_id > *prev_update_id
                         })
                     {
-                        debug!("latest orderbook received from {stream_name} for {instrument_id} with update id {}", orderbook.last_update_id);
+                        debug!(
+                            "latest orderbook received from {stream_name} for {instrument_id} with update id {}: {:?} {:?}",
+                            orderbook.last_update_id, orderbook.bids[0], orderbook.asks[0]
+                        );
                         exchange_message_tx
                             .send(
                                 ExchangeMessage::Orderbook(
@@ -435,7 +546,6 @@ async fn new_message_handler(
                     error!("Error sending pong message: {e}");
                     return;
                 }
-                debug!("orderbook cache: {:?}", orderbooks_cache.keys())
             }
             Some(command) = command_rx.recv() => {
                 if let Err(e) = process_exchange_command(command, &mut websocket_tx, subscribed_channels).await {
