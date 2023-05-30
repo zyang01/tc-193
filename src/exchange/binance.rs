@@ -5,7 +5,7 @@ use log::{debug, error, info, trace, warn};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     time::{Duration, SystemTime},
 };
 use tokio::{net::TcpStream, select, sync::mpsc, task::JoinHandle};
@@ -297,7 +297,7 @@ async fn process_orderbook_diff(
     stream_name: String,
     orderbook_diff: OrderbookDiff,
     orderbooks_cache: &mut HashMap<String, Orderbook>,
-    orderbook_diff_cache: &mut HashMap<String, VecDeque<OrderbookDiff>>,
+    orderbook_diff_cache: &mut HashMap<String, Vec<OrderbookDiff>>,
     orderbook_get_requests: &mut HashMap<String, JoinHandle<Result<Orderbook, reqwest::Error>>>,
 ) {
     if orderbooks_cache
@@ -319,8 +319,8 @@ async fn process_orderbook_diff(
     // cache orderbook diff
     orderbook_diff_cache
         .entry(stream_name.clone())
-        .or_insert_with(VecDeque::new)
-        .push_back(orderbook_diff);
+        .or_insert_with(Vec::new)
+        .push(orderbook_diff);
 
     // orderbook cache is not up to date, request or wait for orderbook via get request
     match orderbook_get_requests.get_mut(&stream_name) {
@@ -361,6 +361,11 @@ async fn process_orderbook_diff(
             } else {
                 // remove errored request
                 orderbook_get_requests.remove(&stream_name);
+
+                // drain cache
+                if let Some(diff_cache_vec) = orderbook_diff_cache.get_mut(&stream_name) {
+                    diff_cache_vec.drain(..diff_cache_vec.len() - 1);
+                }
             }
         }
         Some(_) => {
@@ -395,7 +400,7 @@ async fn process_websocket_message(
     exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
     orderbooks_cache: &mut HashMap<String, Orderbook>,
     latest_orderbook_update_id: &mut HashMap<String, u64>,
-    orderbook_diff_cache: &mut HashMap<String, VecDeque<OrderbookDiff>>,
+    orderbook_diff_cache: &mut HashMap<String, Vec<OrderbookDiff>>,
     orderbook_get_requests: &mut HashMap<String, JoinHandle<Result<Orderbook, reqwest::Error>>>,
 ) -> Result<(), tungstenite::Error> {
     match websocket_message {
@@ -515,7 +520,7 @@ async fn new_message_handler(
     let mut latest_orderbook_update_id: HashMap<String, u64> = HashMap::new();
 
     // Orderbook diff cache by channel/stream name, with values being a queue of orderbook diffs
-    let mut orderbook_diff_cache: HashMap<String, VecDeque<OrderbookDiff>> = HashMap::new();
+    let mut orderbook_diff_cache: HashMap<String, Vec<OrderbookDiff>> = HashMap::new();
 
     // Orderbook get requests by channel/stream name, with values being the join handle
     let mut orderbook_get_requests: HashMap<String, JoinHandle<Result<Orderbook, reqwest::Error>>> =
