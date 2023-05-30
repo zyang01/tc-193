@@ -79,11 +79,11 @@ async fn book_summary_broadcaster(broadcast_tx: Sender<Summary>, instrument_ids:
     let (exchange_message_tx, mut exchange_message_rx) =
         mpsc::unbounded_channel::<ExchangeMessage>();
 
-    let mut bitstamp_conn = bitstamp::BitstampConnection::new(exchange_message_tx.clone());
+    let mut _bitstamp_conn = bitstamp::BitstampConnection::new(exchange_message_tx.clone());
     let mut binance_conn = binance::BinanceConnection::new(exchange_message_tx);
 
     for instrument_id in instrument_ids.iter() {
-        bitstamp_conn.subscribe_orderbook(instrument_id);
+        // bitstamp_conn.subscribe_orderbook(instrument_id);
         binance_conn.subscribe_orderbook(instrument_id);
     }
 

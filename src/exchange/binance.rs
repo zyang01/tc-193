@@ -1,10 +1,13 @@
 use super::{Command, ExchangeConnection};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use itertools::Itertools;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
 use serde_json::json;
-use std::{collections::HashSet, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    time::SystemTime,
+};
 use tokio::{net::TcpStream, select, sync::mpsc};
 use tokio_tungstenite::{
     tungstenite::{self, Message},
@@ -18,7 +21,7 @@ const PONG_INTERVAL_SECONDS: u64 = 30;
 const PONG_MESSAGE: Message = Message::Pong(vec![]);
 
 /// Orderbook update
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Orderbook {
     #[serde(rename = "lastUpdateId")]
     last_update_id: u64,
@@ -27,6 +30,24 @@ struct Orderbook {
     bids: Vec<[String; 2]>,
 
     /// Asks represented as `[[price, amount], ...]`
+    asks: Vec<[String; 2]>,
+}
+
+/// Orderbook diff update
+#[derive(Debug, Deserialize)]
+struct OrderbookDiff {
+    #[serde(rename = "U")]
+    first_update_id: u64,
+
+    #[serde(rename = "u")]
+    last_update_id: u64,
+
+    /// Bids represented as `[[price, amount], ...]`
+    #[serde(rename = "b")]
+    bids: Vec<[String; 2]>,
+
+    /// Asks represented as `[[price, amount], ...]`
+    #[serde(rename = "a")]
     asks: Vec<[String; 2]>,
 }
 
@@ -44,20 +65,26 @@ impl Into<super::Orderbook> for Orderbook {
 /// Binance websocket message types
 #[derive(Debug)]
 enum ExchangeMessage {
-    /// Orderbook update
-    Orderbook(String, Orderbook),
+    /// Orderbook update represented as `(instrument_id, stream_name, orderbook)`
+    Orderbook(String, String, Orderbook),
+
+    /// Orderbook diff update represented as `(instrument_id, orderbook_diff)`
+    OrderbookDiff(String, OrderbookDiff),
 }
 
 impl Into<super::ExchangeMessage> for ExchangeMessage {
     /// Converts exchange message to `super::ExchangeMessage`
     fn into(self) -> super::ExchangeMessage {
         match self {
-            ExchangeMessage::Orderbook(instrument_id, orderbook) => {
+            ExchangeMessage::Orderbook(instrument_id, _stream_name, orderbook) => {
                 super::ExchangeMessage::Orderbook(
                     EXCHANGE_NAME.to_string(),
                     instrument_id,
                     orderbook.into(),
                 )
+            }
+            ExchangeMessage::OrderbookDiff(_, _) => {
+                panic!("Cannot convert OrderbookDiff to ExchangeMessage")
             }
         }
     }
@@ -123,15 +150,24 @@ fn new_subscribe_message(channels: Vec<String>) -> String {
 fn parse_exchange_message(message: &Message) -> Option<ExchangeMessage> {
     let mut message: serde_json::Value = serde_json::from_str(message.to_text().ok()?).ok()?;
     let data = message["data"].take();
-    let mut stream = message.get("stream")?.as_str()?.split("@");
-    let instrument_id = stream.next();
-    let stream_name = stream.next();
+    let stream = message.get("stream")?.as_str()?;
+    let mut stream_split = stream.split("@");
+    let instrument_id = stream_split.next();
+    let stream_name = stream_split.next();
     match stream_name {
         Some("depth10") | Some("depth20") => {
             let orderbook: Orderbook = serde_json::from_value(data).ok()?;
             Some(ExchangeMessage::Orderbook(
                 instrument_id?.to_string(),
+                stream.to_string(),
                 orderbook,
+            ))
+        }
+        Some("depth") => {
+            let orderbook_diff: OrderbookDiff = serde_json::from_value(data).ok()?;
+            Some(ExchangeMessage::OrderbookDiff(
+                instrument_id?.to_string(),
+                orderbook_diff,
             ))
         }
         _ => None,
@@ -156,9 +192,9 @@ async fn process_exchange_command(
         Command::SubscribeOrderbook(instrument_id) => {
             info!("Subscribing to {instrument_id} orderbook on Binance");
             let channels = vec![
-                // format!("{instrument_id}@depth@100ms"),
+                format!("{instrument_id}@depth@100ms"),
                 format!("{instrument_id}@depth10@100ms"),
-                // format!("{instrument_id}@depth20@100ms"),
+                format!("{instrument_id}@depth20@100ms"),
             ];
             channels.iter().for_each(|channel| {
                 subscribed_channels.insert(channel.to_string());
@@ -184,11 +220,42 @@ async fn process_exchange_command(
 async fn process_websocket_message(
     websocket_message: Option<Result<Message, tungstenite::Error>>,
     exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
+    orderbooks_cache: &mut HashMap<String, Orderbook>,
+    latest_orderbook_update_id: &mut HashMap<String, u64>,
 ) -> Result<(), tungstenite::Error> {
     match websocket_message {
         Some(Ok(message)) if message.is_text() => {
             match parse_exchange_message(&message) {
-                Some(message) => exchange_message_tx.send(message.into()).unwrap(),
+                Some(ExchangeMessage::OrderbookDiff(instrument_id, orderbook_diff)) => {
+                    debug!(
+                        "orderbook diff received from for {instrument_id} {}->{}",
+                        orderbook_diff.first_update_id, orderbook_diff.last_update_id
+                    );
+                }
+                Some(ExchangeMessage::Orderbook(instrument_id, stream_name, orderbook)) => {
+                    if latest_orderbook_update_id
+                        .get(&instrument_id)
+                        .map_or(true, |prev_update_id| {
+                            orderbook.last_update_id > *prev_update_id
+                        })
+                    {
+                        debug!("latest orderbook received from {stream_name} for {instrument_id} with update id {}", orderbook.last_update_id);
+                        exchange_message_tx
+                            .send(
+                                ExchangeMessage::Orderbook(
+                                    instrument_id.to_string(),
+                                    stream_name.to_string(),
+                                    orderbook.clone(),
+                                )
+                                .into(),
+                            )
+                            .unwrap();
+
+                        latest_orderbook_update_id
+                            .insert(instrument_id.clone(), orderbook.last_update_id);
+                        orderbooks_cache.insert(stream_name, orderbook);
+                    }
+                }
                 None => info!("Message received from Binance: {message}"),
             }
             Ok(())
@@ -220,6 +287,12 @@ async fn new_message_handler(
     command_rx: &mut mpsc::UnboundedReceiver<Command>,
     exchange_message_tx: &mut mpsc::UnboundedSender<super::ExchangeMessage>,
 ) {
+    // Orderbooks by channel/stream name, with values being the orderbook
+    let mut orderbooks_cache: HashMap<String, Orderbook> = HashMap::new();
+
+    // Latest orderbook update id by instrument id
+    let mut latest_orderbook_update_id: HashMap<String, u64> = HashMap::new();
+
     let (mut websocket_tx, mut websocket_rx) = websocket_stream.split();
 
     if !subscribed_channels.is_empty() {
@@ -245,6 +318,7 @@ async fn new_message_handler(
                     error!("Error sending pong message: {e}");
                     return;
                 }
+                debug!("orderbook cache: {:?}", orderbooks_cache.keys())
             }
             Some(command) = command_rx.recv() => {
                 if let Err(e) = process_exchange_command(command, &mut websocket_tx, subscribed_channels).await {
@@ -253,7 +327,12 @@ async fn new_message_handler(
                 }
             }
             websocket_message = websocket_rx.next() => {
-                if let Err(e) = process_websocket_message(websocket_message, exchange_message_tx).await {
+                if let Err(e) = process_websocket_message(
+                    websocket_message,
+                    exchange_message_tx,
+                    &mut orderbooks_cache,
+                    &mut latest_orderbook_update_id
+                ).await {
                     error!("Error processing websocket message: {e}");
                     return
                 }
@@ -405,7 +484,7 @@ mod tests {
     fn can_parse_exchange_message() {
         let websocket_message = example_orderbook_data();
 
-        if let Some(ExchangeMessage::Orderbook(instrument_id, orderbook)) =
+        if let Some(ExchangeMessage::Orderbook(instrument_id, _stream_name, orderbook)) =
             parse_exchange_message(&websocket_message.into())
         {
             assert_eq!(instrument_id, "btcusdt");
@@ -434,7 +513,7 @@ mod tests {
 
     #[test]
     fn can_convert_orderbook() {
-        if let Some(ExchangeMessage::Orderbook(instrument_id, orderbook)) =
+        if let Some(ExchangeMessage::Orderbook(instrument_id, _stream_name, orderbook)) =
             parse_exchange_message(&example_orderbook_data().into())
         {
             let orderbook: super::super::Orderbook = orderbook.into();
